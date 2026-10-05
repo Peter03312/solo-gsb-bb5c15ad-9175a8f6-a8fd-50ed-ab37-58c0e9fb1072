@@ -63,6 +63,29 @@ function lastCutAtOrBelow(cuts, t) {
   return lo > 0 ? cuts[lo - 1] : null;
 }
 
+/**
+ * 词段 [sDef, eDef] 结束侧的切点上界：
+ * 切点落在词段内部（已在 analyzeCuts 报冲突）或恰为 eDef 时，E 不得越过它；
+ * 切点在 eDef 之后则与本段无关（它约束的是后面的段），本段的上界由非重叠链传递。
+ */
+function endCutBound(words, segs, cuts, info, i) {
+  const nextStart = i + 1 < segs.length ? words[segs[i + 1][0]].start_ms : Infinity;
+  const c = firstCutAtOrAbove(cuts, info[i].eDef);
+  return c !== null && c <= nextStart ? c : Infinity;
+}
+
+/**
+ * 词段 [sDef, eDef] 开始侧的切点下界：
+ * 切点落在本段词之前、且晚于前段首词开始（即处于两分段之间的间隙，无论它具体在
+ * 前段结束的哪一侧）时，本段开始时间都不得早于该切点——字幕不能跨过切点向左扩。
+ * 恰为 sDef 时 S 与切点相接合法。更早的切点属于前一分段，与本段无关。
+ */
+function startCutBound(words, segs, cuts, info, i) {
+  const prevSegStart = i > 0 ? words[segs[i - 1][0]].start_ms : -Infinity;
+  const c = lastCutAtOrBelow(cuts, info[i].sDef);
+  return c !== null && c > prevSegStart ? c : null;
+}
+
 /** >= t 的最小切点；无则 null */
 function firstCutAtOrAbove(cuts, t) {
   let lo = 0, hi = cuts.length; // 找第一个 >= t 的位置
@@ -94,10 +117,17 @@ function analyzeCuts(words, cuts, conflicts) {
           `镜头切点 ${c}ms 落在词 "${w.text}" 的时段 [${w.start_ms}, ${w.end_ms}] 内部：` +
           `字幕不得跨镜头切点，也不得缩短词本身的时段，两个条件无法同时满足`,
       });
-    } else if (c <= w.start_ms) {
-      if (k >= 1) forcedBreaks.add(k - 1);
+    } else if (c < w.start_ms) {
+      // 切点严格落在词 k 之前：与前一词（若存在）结束比较——
+      // end_{k-1} <= c 时它位于两词间隙，断点在 k-1 与 k 之间
+      if (k >= 1 && words[k - 1].end_ms <= c) forcedBreaks.add(k - 1);
+    } else if (c === w.start_ms) {
+      // 切点恰为词 k 的开始：若 end_{k-1} <= c，它位于词 k-1 与词 k 之间的
+      // 间隙，断点在 k-1 与 k 之间（字幕与切点首尾相接合法）
+      if (k >= 1 && words[k - 1].end_ms <= c) forcedBreaks.add(k - 1);
     } else {
-      // c == w.end_ms（start < c <= end 且非内部，只可能等于 end）
+      // c == w.end_ms（start < c <= end 且非内部，只可能等于 end）：
+      // 切点位于词 k 与下一词之间的间隙，断点在 k 与 k+1 之间
       if (k + 1 <= n - 1) forcedBreaks.add(k);
     }
   }
@@ -136,58 +166,107 @@ function segmentRegion(words, a, b, forcedBreaks, rules, conflicts) {
 }
 
 /**
- * 为一个区域内的分段从左到右分配时间。
+ * 为一个区域内的分段分配时间（相邻分段联合求解，避免单向贪心把后条挤死）。
  * lowerBound / upperBound：区域两端由锁定字幕（或视频边界）给出的时间界限。
- * 每条字幕：默认取 [首词.start, 末词.end]，必要时先向后、再向前扩展以满足
- * 最短时长与每秒字数；扩展空间被相邻字幕与镜头切点限制，仍不够则记冲突。
+ *
+ * 每条字幕的硬窗口 [floor_i, ceil_i]：floor 由区域下界与本词段之前间隙里的
+ * 最近切点给出，ceil 由区域上界与本词段之后间隙里的最近切点给出；需求 need_i
+ * 取词跨度、最短时长、字速要求三者最大值。切点落在两段词之间的间隙时，两侧
+ * 字幕分别贴着它结束/开始（允许首尾相接，即 S==cut、E==cut 都合法）。
+ *
+ * 两遍求解：
+ *   1. 后向传播：从右向左求每条字幕的最迟可行开始 LS_i（受词包含上界、结束
+ *      侧切点/区域上界、以及右侧全部字幕需求空间三重限制）。这一步先保证后一条
+ *      字幕在切点前的显示时间；本段最早可行开始 lo_i > LS_i 即整条链确实无解，
+ *      按词段记 duration 冲突。
+ *   2. 前向构造：默认锚定首词开始并向后延长（保持原“优先向后延长”的习惯），
+ *      只有会挤占后条必需空间（越过 LS_{i+1}）时才整体向前挪；可行性已在
+ *      后向传播中证明，构造期不会产生新的冲突。
  */
 function timeRegion(words, segs, cuts, rules, lowerBound, upperBound, conflicts) {
-  const cues = [];
-  let prevE = lowerBound;
-  for (let i = 0; i < segs.length; i++) {
-    const [p, q] = segs[i];
+  const m = segs.length;
+  const info = segs.map(([p, q]) => {
     const text = joinWords(words.slice(p, q + 1).map((w) => w.text));
     const sDef = words[p].start_ms;
     const eDef = words[q].end_ms;
-    const span = eDef - sDef;
     const cpsNeed = Math.ceil((text.length / rules.max_cps) * 1000);
-    const need = Math.max(span, rules.min_duration_ms, cpsNeed);
+    const need = Math.max(eDef - sDef, rules.min_duration_ms, cpsNeed);
+    return { p, q, text, sDef, eDef, cpsNeed, need };
+  });
 
-    // S 的下界：前一条字幕的结束、区域下界、以及 <= sDef 的最近切点
-    let lowS = Math.max(prevE, 0);
-    const cutBelow = lastCutAtOrBelow(cuts, sDef);
-    if (cutBelow !== null) lowS = Math.max(lowS, cutBelow);
-    // E 的上界：区域上界、下一段首词的开始（下一段的 S 不可能超过其首词开始）、>= eDef 的最近切点
-    let hiE = upperBound;
-    if (i + 1 < segs.length) hiE = Math.min(hiE, words[segs[i + 1][0]].start_ms);
-    const cutAbove = firstCutAtOrAbove(cuts, eDef);
-    if (cutAbove !== null) hiE = Math.min(hiE, cutAbove);
+  // 每条字幕开始时间 S_i 的自身约束：
+  //   词完整包含：eDef_i - need_i <= S_i <= sDef_i
+  //   切点/区域：floor_i <= S_i（floor 见下）、S_i + need_i <= ceil_i
+  // 切点落在两段词之间的间隙时，两侧字幕分别贴着它开始/结束（允许首尾相接，
+  // 即 S==cut、E==cut 都合法）；隔段之外的切点由非重叠链逐段传递，不直接计入。
+  const floor = info.map((t, i) =>
+    Math.max(lowerBound, 0, startCutBound(words, segs, cuts, info, i) ?? -Infinity)
+  );
+  const ceil = info.map((t, i) =>
+    Math.min(upperBound, endCutBound(words, segs, cuts, info, i))
+  );
+  // lo_i：只看本段自身的最早可行开始（区域/切点 + 词包含下界）
+  const lo = info.map((t, i) => Math.max(floor[i], t.eDef - t.need));
 
-    let S = sDef;
-    let E = S + need;
-    if (E > hiE) { E = hiE; S = E - need; } // 先尽量向后扩，不够再向前借
-    if (S < lowS) {
+  // 1) 后向传播：LS_i = 允许 S_i 取到的最大值（含），同时受词包含上界、
+  //    结束侧切点/区域上界、以及右侧全部字幕需求空间的限制
+  const LS = new Array(m);
+  for (let i = m - 1; i >= 0; i--) {
+    let v = Math.min(info[i].sDef, ceil[i] - info[i].need);
+    if (i + 1 < m) {
+      // 后一条最迟 LS_{i+1} 开始：本条约占空间到 S_{i+1}，
+      // 故 S_i + need_i <= S_{i+1} <= LS_{i+1}
+      v = Math.min(v, LS[i + 1] - info[i].need);
+    }
+    LS[i] = v;
+  }
+
+  // 2) 前向构造：优先保持词时段并向后延长，必要时（给后条让路）再向前借
+  const cues = [];
+  let prevE = lowerBound;
+  for (let i = 0; i < m; i++) {
+    const t = info[i];
+    const lowS = Math.max(prevE, lo[i]);
+    if (lowS > LS[i]) {
+      // 后向传播已证明整条链无解：用本条紧卡的窗口说明冲突
+      const span = t.eDef - t.sDef;
       const reasons = [];
       if (rules.min_duration_ms > span) reasons.push(`最短显示时长 ${rules.min_duration_ms}ms`);
-      if (cpsNeed > span) {
+      if (t.cpsNeed > span) {
         reasons.push(
-          `每秒最多 ${rules.max_cps} 字（该段 ${text.length} 字 / ${(span / 1000).toFixed(2)}s` +
-          ` = ${(text.length / (span / 1000)).toFixed(1)} 字/秒）`
+          `每秒最多 ${rules.max_cps} 字（该段 ${t.text.length} 字 / ${(span / 1000).toFixed(2)}s` +
+          ` = ${(t.text.length / (span / 1000)).toFixed(1)} 字/秒）`
         );
+      }
+      // 有效结束点：自身切点/下一段首词开始，以及后向传播为右侧字幕预留空间后
+      // 本条最迟允许的结束（LS_i + need_i）。后者更小时，说明是被右侧字幕挤爆。
+      const nextStart = i + 1 < m ? words[segs[i + 1][0]].start_ms : Infinity;
+      const effEnd = Math.min(ceil[i], nextStart, LS[i] + t.need);
+      const avail = Math.max(0, effEnd - Math.max(prevE, floor[i]));
+      let message =
+        `词段 [${t.p}..${t.q}] "${preview(words, t.p, t.q)}" 需要至少 ${t.need}ms 才能满足` +
+        `${reasons.join(' 与 ')}，但受相邻字幕/镜头切点限制，可用空间只有 ${avail}ms`;
+      if (i + 1 < m && effEnd === LS[i] + t.need && effEnd < Math.min(ceil[i], nextStart)) {
+        message += `（其后 ${m - 1 - i} 条相邻字幕共需显示时间，本段最迟只能占到 ${effEnd}ms 结束）`;
       }
       conflicts.push({
         type: 'duration',
-        word_start: p,
-        word_end: q,
-        message:
-          `词段 [${p}..${q}] "${preview(words, p, q)}" 需要至少 ${need}ms 才能满足` +
-          `${reasons.join(' 与 ')}，但受相邻字幕/镜头切点限制，可用空间只有 ${Math.max(0, hiE - lowS)}ms`,
+        word_start: t.p,
+        word_end: t.q,
+        message,
       });
       // 冲突收集模式下仍放一个占位，保证后续段的边界推算正常
-      S = Math.max(lowS, hiE - need);
-      E = hiE;
+      cues.push({
+        word_start: t.p, word_end: t.q, text: t.text,
+        start_ms: lowS, end_ms: lowS + t.need, locked: 0,
+      });
+      prevE = lowS + t.need;
+      continue;
     }
-    cues.push({ word_start: p, word_end: q, text, start_ms: S, end_ms: E, locked: 0 });
+    // 默认从首词开始、向后延长 need；若挤到后一条的最迟开始，则把整段向前挪
+    const S = Math.max(lowS, Math.min(t.sDef, LS[i]));
+    const E = S + t.need;
+    cues.push({ word_start: t.p, word_end: t.q, text: t.text, start_ms: S, end_ms: E, locked: 0 });
     prevE = E;
   }
   return cues;
