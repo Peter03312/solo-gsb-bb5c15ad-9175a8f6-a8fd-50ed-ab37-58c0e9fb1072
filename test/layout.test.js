@@ -74,6 +74,98 @@ test('切点落在词内部 → 报告冲突，不输出结果', () => {
   assert.match(r.conflicts[0].message, /跨镜头切点/);
 });
 
+test('相邻字幕时间分配：前条向前借，不挤占后条切点前显示（回归）', () => {
+  // A[1000,1100]、B[1500,1600]，1700 切点；每词一条、最短 600ms。
+  // 旧算法让 A 一味向后顶到 1500，B 只剩 [1500,1700]=200ms → 误报时长冲突；
+  // 正确排法：A[500,1100]、B[1100,1700]（前条向前借空闲间隙）。
+  const words = W([['A', 1000, 1100], ['B', 1500, 1600]]);
+  const r = computeLayout({
+    words, cuts: [1700],
+    rules: { max_chars: 1, min_duration_ms: 600, max_cps: 100 }, locked: [],
+  });
+  assert.equal(r.ok, true, JSON.stringify(r.conflicts));
+  assert.deepEqual(
+    r.cues.map((c) => [c.start_ms, c.end_ms]),
+    [[500, 1100], [1100, 1700]],
+  );
+  assert.equal(validateStructure(r.cues, words, [1700]).length, 0);
+});
+
+test('三段链：前条只借到恰好满足，中间间隙留给后续字幕', () => {
+  // 三词各 100ms、最短 600ms；切点 2100；0..2100 恰好容纳三条 600ms。
+  // 旧贪心把 A 顶到 1000、B 顶到 1500，C 在切点前只剩 600 看似够，
+  // 但 B 默认后顶会直接吃掉 C 的空间 → 误报冲突；
+  // 正确链解：A[300,900]、B[900,1500]、C[1500,2100]（各 600ms、首尾相接）。
+  const words = W([['甲', 800, 900], ['乙', 1400, 1500], ['丙', 2000, 2100]]);
+  const r = computeLayout({
+    words, cuts: [2100],
+    rules: { max_chars: 1, min_duration_ms: 600, max_cps: 100 }, locked: [],
+  });
+  assert.equal(r.ok, true, JSON.stringify(r.conflicts));
+  assert.deepEqual(
+    r.cues.map((c) => [c.start_ms, c.end_ms]),
+    [[300, 900], [900, 1500], [1500, 2100]],
+  );
+  assert.equal(validateStructure(r.cues, words, [2100]).length, 0);
+});
+
+test('无需扩展时保持词时段，不前移也不后占', () => {
+  // 词本身时长已达最短要求、间隙充足：字幕就用 [sDef, eDef]，相邻间隙原样保留
+  const words = W([['甲', 0, 1000], ['乙', 3000, 4000]]);
+  const r = computeLayout({
+    words, cuts: [], rules: { max_chars: 1, min_duration_ms: 600, max_cps: 100 }, locked: [],
+  });
+  assert.equal(r.ok, true);
+  assert.deepEqual(
+    r.cues.map((c) => [c.start_ms, c.end_ms]),
+    [[0, 1000], [3000, 4000]],
+  );
+});
+
+test('确实无解：双侧都被锁死时仍按词段报 duration 冲突', () => {
+  // 两条锁定字幕把唯一未锁定词夹在 1000..1200（200ms），最短需 600ms → 无解
+  const words = W([['锁一', 0, 300], ['挤', 1050, 1150], ['锁二', 2000, 2300]]);
+  const locked = [
+    { word_start: 0, word_end: 0, text: '锁一', start_ms: 0, end_ms: 1000 },
+    { word_start: 2, word_end: 2, text: '锁二', start_ms: 1200, end_ms: 2400 },
+  ];
+  const r = computeLayout({
+    words, cuts: [], rules: { max_chars: 1, min_duration_ms: 600, max_cps: 100 }, locked,
+  });
+  assert.equal(r.ok, false);
+  const c = r.conflicts.find((x) => x.type === 'duration');
+  assert.ok(c, '应有 duration 冲突');
+  assert.equal(c.word_start, 1);
+  assert.equal(c.word_end, 1);
+  assert.match(c.message, /600ms/);
+});
+
+test('间隙切点限制前条结束：不得跨过切点向后借', () => {
+  // 甲[0,100] 需 600ms；间隙切点 1000 要求甲结束 <=1000（实际只需 600，故 [0,600]），
+  // 乙在 2000 之后，自身 [2000,2600]；切点不得落在任何字幕内
+  const words = W([['甲', 0, 100], ['乙', 2000, 2400]]);
+  const r = computeLayout({
+    words, cuts: [1000], rules: { max_chars: 1, min_duration_ms: 600, max_cps: 100 }, locked: [],
+  });
+  assert.equal(r.ok, true, JSON.stringify(r.conflicts));
+  assert.deepEqual(
+    r.cues.map((c) => [c.start_ms, c.end_ms]),
+    [[0, 600], [2000, 2600]],
+  );
+  assert.equal(validateStructure(r.cues, words, [1000]).length, 0);
+});
+
+test('锁定字幕给出区域下界：后续未锁定行从锁定结束之后排起', () => {
+  const words = W([['锁', 0, 100], ['后', 2000, 2100]]);
+  const locked = [{ word_start: 0, word_end: 0, text: '锁', start_ms: 0, end_ms: 1000, locked: 1 }];
+  const r = computeLayout({
+    words, cuts: [], rules: { max_chars: 1, min_duration_ms: 500, max_cps: 100 }, locked,
+  });
+  assert.equal(r.ok, true, JSON.stringify(r.conflicts));
+  const fresh = r.cues.filter((c) => c.locked === 0);
+  assert.deepEqual(fresh.map((c) => [c.start_ms, c.end_ms]), [[2000, 2500]]);
+});
+
 test('最短时长：向后扩展空闲间隙', () => {
   // max_chars=1 → 每词一条；第一条 [0,300] 需扩到 1000ms，后方间隙足够
   const words = W([['短', 0, 300], ['词', 2000, 2400]]);
